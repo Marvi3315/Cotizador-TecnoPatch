@@ -2,6 +2,7 @@ const https = require('https');
 
 let cachedToken = null;
 let tokenExpiry = 0;
+let cachedTipoCambio = null;
 
 async function fetchJson(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -28,23 +29,15 @@ async function fetchJson(url, options = {}) {
 
 async function getToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-
   const CLIENT_ID     = process.env.SYSCOM_CLIENT_ID;
   const CLIENT_SECRET = process.env.SYSCOM_CLIENT_SECRET;
   if (!CLIENT_ID || !CLIENT_SECRET) throw new Error('Credenciales Syscom no configuradas');
-
   const body = `client_id=${encodeURIComponent(CLIENT_ID)}&client_secret=${encodeURIComponent(CLIENT_SECRET)}&grant_type=client_credentials`;
-
   const urlObj = new URL('https://developers.syscom.mx/oauth/token');
   const res = await new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: urlObj.hostname,
-      path: urlObj.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body)
-      }
+      hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
     }, (r) => {
       let d = '';
       r.on('data', c => d += c);
@@ -54,17 +47,71 @@ async function getToken() {
       });
     });
     req.on('error', reject);
-    req.write(body);
-    req.end();
+    req.write(body); req.end();
   });
-
-  if (res.status !== 200 || !res.body.access_token) {
+  if (res.status !== 200 || !res.body.access_token)
     throw new Error(`Error token Syscom ${res.status}: ${JSON.stringify(res.body)}`);
-  }
-
   cachedToken = res.body.access_token;
   tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
   return cachedToken;
+}
+
+// Normaliza precios: devuelve siempre MXN correctos
+// Estructura real de Syscom:
+//   precio_lista     → MXN (precio público sugerido, ya convertido)
+//   precio_especial  → MXN (precio distribuidor, ya convertido)
+//   precio_descuento → USD (precio promocional al público, hay que convertir)
+//   tipo_cambio      → TC que usó Syscom para convertir (viene en el producto)
+function normalizarPrecios(p) {
+  const parse = (v) => parseFloat(String(v || '0').replace(/,/g, '')) || 0;
+
+  const precioListaMXN    = parse(p.precio_lista);     // Ya en MXN
+  const precioEspecialMXN = parse(p.precio_especial);  // Ya en MXN (costo distribuidor)
+  const precioDescUSD     = parse(p.precio_descuento); // En USD — hay que convertir
+  const tipoCambio        = parse(p.tipo_cambio);      // TC de Syscom
+
+  // Guardar tipo_cambio cuando esté disponible
+  if (tipoCambio > 10) cachedTipoCambio = tipoCambio;
+  const tc = tipoCambio > 10 ? tipoCambio : (cachedTipoCambio || 17.0);
+
+  // precio_descuento en MXN = precio_descuento(USD) × tipo_cambio
+  const precioDescMXN = precioDescUSD > 0 ? precioDescUSD * tc : 0;
+
+  // Precio final al cliente:
+  // Si hay precio_descuento válido (con descuento promocional) → usarlo
+  // Sino usar precio_lista directamente (ya en MXN)
+  const precioCliente = precioDescMXN > 0 ? precioDescMXN : precioListaMXN;
+
+  // Precio lista para tachar (solo si precio cliente tiene descuento)
+  const precioListaMostrar = (precioListaMXN > 0 && precioListaMXN > precioCliente)
+    ? precioListaMXN : 0;
+
+  return {
+    precio_cliente_mxn:   Math.round(precioCliente * 100) / 100,
+    precio_lista_mxn:     precioListaMXN,
+    precio_especial_mxn:  precioEspecialMXN,
+    precio_descuento_usd: precioDescUSD,
+    precio_lista_tachar:  precioListaMostrar,
+    tipo_cambio:          tc,
+    // Conservar campos originales para debug
+    _precio_lista_raw:    p.precio_lista,
+    _precio_especial_raw: p.precio_especial,
+    _precio_descuento_raw: p.precio_descuento,
+  };
+}
+
+function enriquecerProducto(p) {
+  const precios = normalizarPrecios(p);
+  return {
+    ...p,
+    _precios: precios,
+    // Inyectar campos normalizados directamente para facilitar el frontend
+    precio_cliente_mxn:  precios.precio_cliente_mxn,
+    precio_lista_mxn:    precios.precio_lista_mxn,
+    precio_especial_mxn: precios.precio_especial_mxn,
+    precio_lista_tachar: precios.precio_lista_tachar,
+    tipo_cambio:         precios.tipo_cambio,
+  };
 }
 
 exports.handler = async (event) => {
@@ -74,7 +121,6 @@ exports.handler = async (event) => {
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
     'Content-Type': 'application/json'
   };
-
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
 
   const params = event.queryStringParameters || {};
@@ -86,24 +132,30 @@ exports.handler = async (event) => {
     let url = '';
 
     switch (action) {
-
       case 'categorias':
         url = 'https://developers.syscom.mx/api/v1/categorias';
         break;
+
+      case 'tipocambio': {
+        // Endpoint dedicado para obtener el tipo de cambio actual
+        url = `https://developers.syscom.mx/api/v1/productos?categoria=22&pagina=1`;
+        const tcRes = await fetchJson(url, { method: 'GET', headers: authHeaders });
+        const list = Array.isArray(tcRes.body) ? tcRes.body : (tcRes.body?.productos || []);
+        const tc = list.find(p => parseFloat(String(p.tipo_cambio||'0').replace(/,/g,'')) > 10);
+        const tcVal = tc ? parseFloat(String(tc.tipo_cambio).replace(/,/g,'')) : (cachedTipoCambio || 17.0);
+        if (tcVal > 10) cachedTipoCambio = tcVal;
+        return { statusCode: 200, headers, body: JSON.stringify({ tipo_cambio: tcVal, rate: tcVal }) };
+      }
 
       case 'search': {
         const pagina = params.page || 1;
         const q      = (params.q || '').trim();
         const cat    = (params.categoria || '').trim();
-
-        // Syscom REQUIERE al menos busqueda o categoria
-        // Si no hay ninguno, usamos una categoría por defecto (Videovigilancia = 22)
         if (q) {
           url = `https://developers.syscom.mx/api/v1/productos?busqueda=${encodeURIComponent(q)}&pagina=${pagina}`;
         } else if (cat) {
           url = `https://developers.syscom.mx/api/v1/productos?categoria=${encodeURIComponent(cat)}&pagina=${pagina}`;
         } else {
-          // Sin filtro: traer categoría más relevante para TecnoPatch
           url = `https://developers.syscom.mx/api/v1/productos?categoria=22&pagina=${pagina}`;
         }
         break;
@@ -116,58 +168,52 @@ exports.handler = async (event) => {
         break;
       }
 
-      case 'categoria': {
-        const cat    = (params.categoria || '22').trim();
-        const pagina = params.page || 1;
-        url = `https://developers.syscom.mx/api/v1/productos?categoria=${encodeURIComponent(cat)}&pagina=${pagina}`;
-        break;
-      }
-
       case 'debug': {
-        // Devuelve raw de 1 producto para inspeccionar estructura de precios
         const cat = (params.categoria || '22').trim();
         url = `https://developers.syscom.mx/api/v1/productos?categoria=${encodeURIComponent(cat)}&pagina=1`;
         const dbgRes = await fetchJson(url, { method: 'GET', headers: authHeaders });
-        if (dbgRes.status !== 200) {
-          return { statusCode: dbgRes.status, headers, body: JSON.stringify({ error: 'Syscom error', detail: dbgRes.body }) };
-        }
         const list = Array.isArray(dbgRes.body) ? dbgRes.body : (dbgRes.body?.productos || []);
         const sample = list[0] || null;
+        const precios = sample ? normalizarPrecios(sample) : null;
         return {
           statusCode: 200, headers,
           body: JSON.stringify({
             _debug: true,
             total_productos: list.length,
-            campos_precio: sample ? {
+            precios_normalizados: precios,
+            campos_raw: sample ? {
               precio_especial: sample.precio_especial,
               precio_lista: sample.precio_lista,
               precio_descuento: sample.precio_descuento,
-              precios: sample.precios,
-              tipo_precio_especial: typeof sample.precio_especial,
-              tipo_precio_lista: typeof sample.precio_lista,
+              tipo_cambio: sample.tipo_cambio,
             } : null,
-            raw_producto: sample
+            raw_producto: sample,
           })
         };
       }
 
       default:
-        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Acción no válida: ' + action }) };
+        return { statusCode: 400, headers, body: JSON.stringify({ error: 'Acción no válida' }) };
     }
 
     console.log('Syscom URL:', url);
     const res = await fetchJson(url, { method: 'GET', headers: authHeaders });
-    console.log('Syscom status:', res.status);
 
     if (res.status !== 200) {
-      return {
-        statusCode: res.status,
-        headers,
-        body: JSON.stringify({ error: `Error de Syscom: ${res.status}`, detail: res.body })
-      };
+      return { statusCode: res.status, headers, body: JSON.stringify({ error: `Error Syscom ${res.status}`, detail: res.body }) };
     }
 
-    return { statusCode: 200, headers, body: JSON.stringify(res.body) };
+    // Enriquecer cada producto con precios normalizados
+    let body = res.body;
+    if (Array.isArray(body)) {
+      body = body.map(enriquecerProducto);
+    } else if (body && Array.isArray(body.productos)) {
+      body = { ...body, productos: body.productos.map(enriquecerProducto) };
+    } else if (body && body.producto_id) {
+      body = enriquecerProducto(body);
+    }
+
+    return { statusCode: 200, headers, body: JSON.stringify(body) };
 
   } catch (err) {
     console.error('Syscom proxy error:', err.message);
