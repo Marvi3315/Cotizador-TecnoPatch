@@ -38,31 +38,84 @@ export async function obtenerCategorias() {
   return Array.isArray(data) ? data : (data.categorias || [])
 }
 
+// ─── Normalizar producto Syscom ───────────────────────────────────────────────
+//
+// ESTRUCTURA DE PRECIOS EN SYSCOM API:
+//   precio_especial  → precio distribuidor en USD (tu costo de compra)
+//   precio_lista     → precio público sugerido en USD
+//   precio_descuento → precio final en MXN con IVA incluido (lo que ve el cliente)
+//   tipo_cambio      → tipo de cambio MXN/USD que Syscom aplica
+//
+// REGLA: siempre mostrar precio_descuento como precio al cliente (ya es MXN + IVA)
+//        El precio_especial y precio_lista son USD → multiplicar × tipo_cambio para MXN
+//
 export function normalizarProducto(p, idx = 0) {
   const parsePrice = (v) => parseFloat(String(v || '0').replace(/,/g, '')) || 0
-  const pEspecial  = parsePrice(p.precio_especial)  || parsePrice(p.precios?.precio_especial)
-  const pDescuento = parsePrice(p.precio_descuento) || parsePrice(p.precios?.precio_descuento)
-  const pLista     = parsePrice(p.precio_lista)     || parsePrice(p.precios?.precio_lista)
-  const tipoCambio = parsePrice(p.tipo_cambio) || 0
-  const costoSyscom = pEspecial > 0 ? pEspecial : (pDescuento > 0 ? pDescuento : pLista)
-  const precioCliente = pEspecial > 0 ? Math.ceil(pEspecial * 1.25) : pLista > 0 ? pLista : 0
+
+  // Precios en USD (costo distribuidor y lista)
+  const precioEspecialUSD = parsePrice(p.precio_especial)  || parsePrice(p.precios?.precio_especial)  || parsePrice(p.precios?.especial)
+  const precioListaUSD    = parsePrice(p.precio_lista)     || parsePrice(p.precios?.precio_lista)     || parsePrice(p.precios?.lista)
+
+  // precio_descuento = precio final en MXN con IVA (el precio correcto a mostrar al cliente)
+  const precioDescuentoMXN = parsePrice(p.precio_descuento) || parsePrice(p.precios?.precio_descuento)
+
+  // Tipo de cambio que Syscom usa (viene en el producto)
+  const tipoCambio = parsePrice(p.tipo_cambio) || 17.5
+
+  // Convertir precios USD → MXN usando el tipo de cambio de Syscom
+  const precioEspecialMXN = precioEspecialUSD > 0 ? precioEspecialUSD * tipoCambio : 0
+  const precioListaMXN    = precioListaUSD    > 0 ? precioListaUSD    * tipoCambio : 0
+
+  // PRECIO AL CLIENTE:
+  // 1. precio_descuento si existe (MXN con IVA, ya es el precio final correcto)
+  // 2. precio_lista en MXN como fallback
+  const precioCliente = precioDescuentoMXN > 0
+    ? precioDescuentoMXN
+    : precioListaMXN > 0 ? precioListaMXN : 0
+
+  // PRECIO LISTA (para tachar encima del precio cliente):
+  // Es el precio_lista en MXN sin el descuento promocional
+  const precioListaMostrar = precioListaMXN > 0 && precioListaMXN > precioCliente
+    ? precioListaMXN
+    : 0
+
+  // COSTO (precio distribuidor en MXN, solo visible internamente)
+  const costoMXN = precioEspecialMXN > 0 ? precioEspecialMXN : precioCliente
+
+  // Categoría
   const primeraCat = Array.isArray(p.categorias) ? p.categorias[0] : null
   const catNombre  = primeraCat?.nombre || p.categoria || 'General'
   const catId      = primeraCat?.id || ''
+
+  // Marca
   const marca = typeof p.marca === 'string' ? p.marca : (p.marca?.nombre || '')
-  const stock = typeof p.total_existencia === 'number' ? p.total_existencia : parseInt(p.total_existencia) || null
+
+  // Stock
+  const stock = typeof p.total_existencia === 'number'
+    ? p.total_existencia
+    : parseInt(p.total_existencia) || null
+
   const prodId = p.producto_id ? Number(p.producto_id) : (9000 + idx)
+
   return {
-    id: prodId, syscom_id: prodId,
-    cat: catNombre, catId: String(catId),
-    nombre: p.titulo || p.nombre || 'Producto',
-    descripcion: p.descripcion_corta || '',
-    precio: precioCliente,
-    costo: costoSyscom,
-    precioLista: pLista,
-    precioEspecial: pEspecial,
-    sku: p.modelo || String(p.producto_id || ''),
-    marca, stock, imagen: p.img_portada || p.imagen || '',
-    tipoCambio, proveedor: 'Syscom', _raw: p,
+    id:              prodId,
+    syscom_id:       prodId,
+    cat:             catNombre,
+    catId:           String(catId),
+    nombre:          p.titulo || p.nombre || 'Producto',
+    descripcion:     p.descripcion_corta || '',
+    precio:          precioCliente,       // MXN con IVA — precio al cliente
+    costo:           costoMXN,            // MXN — costo distribuidor (interno)
+    precioLista:     precioListaMostrar,  // MXN — para tachar (precio sin promo)
+    precioEspecial:  precioEspecialMXN,   // MXN — precio especial distribuidor
+    precioEspecialUSD,                    // USD — para referencia
+    precioListaUSD,                       // USD — para referencia
+    tipoCambio,
+    sku:             p.modelo || String(p.producto_id || ''),
+    marca,
+    stock,
+    imagen:          p.img_portada || p.imagen || '',
+    proveedor:       'Syscom',
+    _raw:            p,
   }
 }
